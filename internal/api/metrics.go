@@ -56,8 +56,12 @@ type sourceLatencyBuckets struct {
 	buckets [7]uint64
 }
 
-// Bucket edges in seconds. A latency t falls into bucket i where:
-//   BucketEdges[i-1] < t <= BucketEdges[i]
+// BucketEdges is the edges for latency buckets. A latency t falls into bucket
+// i where: BucketEdges[i-1] < t <= BucketEdges[i] (with BucketEdges[-1] = 0).
+// Latencies > BucketEdges[len-1] go into the last bucket (index 6).
+//
+//	BucketEdges[i-1] < t <= BucketEdges[i]
+//
 // (with BucketEdges[-1] = 0). Latencies > BucketEdges[len-1] go into the
 // last bucket.
 var BucketEdges = []float64{
@@ -163,12 +167,10 @@ func (m *Metrics) SourceLatencyBucketCounts() map[string][]uint64 {
 	defer m.mu.Unlock()
 	out := make(map[string][]uint64, len(m.sourceLatencies))
 	for src, b := range m.sourceLatencies {
-		counts := make([]uint64, len(BucketEdges))
 		b.mu.Lock()
 		copy(b.buckets[:], b.buckets[:]) // copy the array
 		b.mu.Unlock()
-		counts = b.buckets[:]
-		out[src] = counts
+		out[src] = b.buckets[:]
 	}
 	return out
 }
@@ -198,8 +200,8 @@ type metricsBody struct {
 // dependency or an export format decision it cannot take back.
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	body := metricsBody{
-		ScanOutcomes:   map[string]uint64{},
-		SourceFailures: map[string]uint64{},
+		ScanOutcomes:              map[string]uint64{},
+		SourceFailures:            map[string]uint64{},
 		SourceLatencyBucketCounts: map[string][]uint64{},
 	}
 	if s.Metrics != nil {

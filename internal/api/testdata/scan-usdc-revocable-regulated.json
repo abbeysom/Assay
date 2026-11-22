@@ -19,14 +19,14 @@
       "claim": "issuer flags: auth_required=false auth_revocable=true auth_immutable=false auth_clawback_enabled=false",
       "retrieved_at": "2026-08-10T00:00:00Z",
       "source": "horizon",
-      "url": "https://horizon.stellar.org/assets?asset_code=USDC\u0026asset_issuer=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+      "url": "http://127.0.0.1:39729/assets?asset_code=USDC\u0026asset_issuer=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
     },
     {
       "attempted": false,
       "claim": "home_domain \"circle.com\"",
       "retrieved_at": "2026-08-10T00:00:00Z",
       "source": "horizon",
-      "url": "https://horizon.stellar.org/accounts/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+      "url": "http://127.0.0.1:39729/accounts/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
     },
     {
       "attempted": false,
@@ -60,7 +60,7 @@
           "claim": "issuer flags: auth_required=false auth_revocable=true auth_immutable=false auth_clawback_enabled=false",
           "retrieved_at": "2026-08-10T00:00:00Z",
           "source": "horizon",
-          "url": "https://horizon.stellar.org/assets?asset_code=USDC\u0026asset_issuer=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+          "url": "http://127.0.0.1:39729/assets?asset_code=USDC\u0026asset_issuer=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
         }
       ],
       "mechanics": [
@@ -92,7 +92,7 @@
           "claim": "home_domain \"circle.com\"",
           "retrieved_at": "2026-08-10T00:00:00Z",
           "source": "horizon",
-          "url": "https://horizon.stellar.org/accounts/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+          "url": "http://127.0.0.1:39729/accounts/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
         },
         {
           "attempted": false,

@@ -74,15 +74,6 @@ func defaultDeps() commandDeps {
 
 // horizonURL returns the Horizon base URL to use, preferring the flag value
 // over the environment variable, falling back to the public default.
-func horizonURLFromEnvAndFlag(flagValue string) string {
-	if flagValue != "" {
-		return flagValue
-	}
-	if v := os.Getenv("ASSAY_HORIZON_URL"); v != "" {
-		return v
-	}
-	return ""
-}
 
 func usage(w io.Writer) {
 	_, _ = fmt.Fprint(w, `usage:
@@ -204,7 +195,7 @@ func runScan(args []string, d commandDeps) error {
 		hz = os.Getenv("ASSAY_HORIZON_URL")
 	}
 	// Set the env var so that scan.New() picks it up.
-	os.Setenv("ASSAY_HORIZON_URL", hz)
+	os.Setenv("ASSAY_HORIZON_URL", hz) // nolint:errcheck
 
 	scanFn, finish, err := scanFuncForRecording(assetLists(), d, *recordDir, *replayDir)
 	if err != nil {
@@ -383,7 +374,7 @@ func runAttestation(args []string, d commandDeps) error {
 		hz = os.Getenv("ASSAY_HORIZON_URL")
 	}
 	// Set the env var so that scan.New() picks it up.
-	os.Setenv("ASSAY_HORIZON_URL", hz)
+	os.Setenv("ASSAY_HORIZON_URL", hz) // nolint:errcheck
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -593,7 +584,7 @@ func runServe(args []string, log *slog.Logger) error {
 		hz = os.Getenv("ASSAY_HORIZON_URL")
 	}
 	// Set the env var so that newScanner() / scan.New() picks it up.
-	os.Setenv("ASSAY_HORIZON_URL", hz)
+	os.Setenv("ASSAY_HORIZON_URL", hz) // nolint:errcheck
 
 	// The server is where a list configuration matters most: every scan it
 	// serves consults the same configured lists, attributed the same way, and

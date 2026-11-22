@@ -270,7 +270,7 @@ type Client struct {
 	BaseURLs []string
 	// LastURL is the last URL that successfully answered a request, for
 	// evidence attribution. It is updated after each successful fetch.
-	LastURL string
+	LastURL   string
 	HTTP      *http.Client
 	UserAgent string
 }
@@ -295,7 +295,7 @@ func NewWithBaseURLs(baseURLs []string) *Client {
 		return New("")
 	}
 	return &Client{
-		BaseURLs: baseURLs,
+		BaseURLs:  baseURLs,
 		HTTP:      &http.Client{Timeout: 15 * time.Second},
 		UserAgent: defaultUserAgent,
 	}
@@ -450,6 +450,7 @@ func (c *Client) LatestLedger(ctx context.Context) (int64, error) {
 			}
 			return 0, fmt.Errorf("horizon: get /: %w", err)
 		}
+		defer resp.Body.Close() // nolint:errcheck
 		if resp.StatusCode != http.StatusOK {
 			if i+1 < len(urls) {
 				continue
@@ -503,7 +504,7 @@ func (c *Client) getWithLedger(ctx context.Context, path string, out any) (int64
 			}
 			return 0, fmt.Errorf("horizon: get %s on %s: %w", path, url, err)
 		}
-		// Explicitly close the body to avoid leaks; we handle it below.
+		defer resp.Body.Close() // nolint:errcheck
 
 		clockskew.Record(req.Context(), "horizon", resp.Request.URL.String(),
 			resp.Header.Get("Date"), time.Now().UTC())

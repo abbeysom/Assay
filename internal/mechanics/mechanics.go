@@ -239,7 +239,7 @@ type Subject struct {
 	// HorizonBaseURL is the Horizon base URL that answered the asset lookup.
 	// Used to construct evidence URLs that name the actual endpoint.
 	HorizonBaseURL string
-	Issuer     *horizon.Account
+	Issuer         *horizon.Account
 	// IssuerFetchedAt is when Horizon answered the issuer /accounts lookup.
 	IssuerFetchedAt time.Time
 	// IssuerLedger is the ledger sequence Horizon reported for the /accounts query.

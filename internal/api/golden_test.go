@@ -235,9 +235,6 @@ func goldenScanHandler(t *testing.T) http.Handler {
 
 	sc := scan.New()
 	sc.Now = now
-	// The BaseURL stays the real Horizon: evidence URLs name it, and a random
-	// httptest port must not leak into the golden file. The transport sends
-	// the requests to the stub instead.
 	sc.Horizon.BaseURL = horizon.DefaultURL
 	sc.Horizon.HTTP.Transport = &goldenSingleHostTransport{host: strings.TrimPrefix(horizonSrv.URL, "http://")}
 	// The StellarExpert client stamps its own answers with its own clock

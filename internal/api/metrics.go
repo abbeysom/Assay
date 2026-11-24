@@ -173,9 +173,10 @@ func (m *Metrics) SourceLatencyBucketCounts() map[string][]uint64 {
 	out := make(map[string][]uint64, len(m.sourceLatencies))
 	for src, b := range m.sourceLatencies {
 		b.mu.Lock()
-		copy(b.buckets[:], b.buckets[:]) // copy the array
+		dest := make([]uint64, len(b.buckets))
+		copy(dest, b.buckets[:])
 		b.mu.Unlock()
-		out[src] = b.buckets[:]
+		out[src] = dest
 	}
 	return out
 }

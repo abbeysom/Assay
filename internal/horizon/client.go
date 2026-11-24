@@ -298,11 +298,17 @@ func New(baseURL string) *Client {
 // base URLs for failover. BaseURLs are tried in order; the first one is also
 // used as the default for evidence URL purposes.
 func NewWithBaseURLs(baseURLs []string) *Client {
-	if len(baseURLs) == 0 {
+	urls := make([]string, 0, len(baseURLs))
+	for _, u := range baseURLs {
+		if u = strings.TrimSpace(u); u != "" {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
 		return New("")
 	}
 	return &Client{
-		BaseURLs:  baseURLs,
+		BaseURLs:  urls,
 		HTTP:      &http.Client{Timeout: 15 * time.Second},
 		UserAgent: defaultUserAgent,
 	}

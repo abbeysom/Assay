@@ -40,3 +40,15 @@ func TestSourceLatencyIsRecordedForUpstreamFetches(t *testing.T) {
 		t.Error("no stellar.expert fetch was made, so it must have no latency series")
 	}
 }
+
+// TestSourceLatencySnapshotIsACopy pins that a returned snapshot does not alias
+// the live buckets, so later observations cannot change it under the reader.
+func TestSourceLatencySnapshotIsACopy(t *testing.T) {
+	m := NewMetrics()
+	m.IncSourceLatency("horizon", 0)
+	snap := m.SourceLatencyBucketCounts()["horizon"]
+	m.IncSourceLatency("horizon", 0)
+	if snap[0] != 1 {
+		t.Fatalf("snapshot changed after a later observation: %v", snap)
+	}
+}

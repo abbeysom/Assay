@@ -776,14 +776,6 @@ func runServe(args []string, log *slog.Logger) error {
 	// Set the env var so that newScanner() / scan.New() picks it up.
 	os.Setenv("ASSAY_HORIZON_URL", hz) // nolint:errcheck
 
-	// Resolve the Horizon URL: flag takes precedence, then environment variable.
-	hz := *horizonFlag
-	if hz == "" {
-		hz = os.Getenv("ASSAY_HORIZON_URL")
-	}
-	// Set the env var so that newScanner() / scan.New() picks it up.
-	os.Setenv("ASSAY_HORIZON_URL", hz) // nolint:errcheck
-
 	// The server is where a list configuration matters most: every scan it
 	// serves consults the same configured lists, attributed the same way, and
 	// records them in the observation history like any other evidence.

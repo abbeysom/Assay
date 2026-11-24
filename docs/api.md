@@ -35,6 +35,30 @@ services. The server accepts it only when it is **1–128 bytes of
 `[A-Za-z0-9._:-]`**; an empty, over-long, or out-of-charset value is ignored and
 a fresh identifier (16 random bytes, hex-encoded) is generated instead.
 
+## Security Headers
+
+Every response emitted by the server carries baseline security headers:
+- `X-Content-Type-Options: nosniff`: instructs browsers to adhere strictly to the MIME type declared in the `Content-Type` header, preventing MIME-type sniffing.
+- `Referrer-Policy: no-referrer`: prevents emitting the `Referer` header, ensuring URLs and queries are never leaked to external sites.
+- `Content-Security-Policy: frame-ancestors 'none'`: forbids framing by external sites, protecting API endpoints against clickjacking.
+
+### UI Content-Security-Policy
+
+The embedded verdict UI (`GET /`) is served with a strict `Content-Security-Policy` restricting resource loading and execution to the minimum necessary for the single-page application:
+
+```http
+Content-Security-Policy: default-src 'none'; script-src 'sha256-...'; style-src 'sha256-...'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+```
+
+- `default-src 'none'`: blocks all resource types by default.
+- `script-src 'sha256-...'`: permits execution of only the single embedded inline script matching its exact SHA-256 hash. Remote scripts, unhashed inline scripts, and dynamic code evaluation (`eval`) are denied.
+- `style-src 'sha256-...'`: permits application of only the single embedded inline stylesheet matching its exact SHA-256 hash.
+- `connect-src 'self'`: restricts `fetch` requests strictly to same-origin endpoints.
+- `img-src 'self'`: permits images only from the same origin.
+- `base-uri 'none'`: prevents DOM injection of `<base>` tags to redirect relative URLs.
+- `form-action 'self'`: restricts form submissions to the same origin.
+- `frame-ancestors 'none'`: prevents framing and clickjacking overlays by hostile sites.
+
 ## Reverse Proxies and Rate Limiting
 
 In public deployments behind a reverse proxy (such as nginx, Caddy, or a cloud load balancer), `r.RemoteAddr` is the IP of the proxy peer. Without proxy awareness, all clients connecting through that proxy share a single rate-limiting bucket.

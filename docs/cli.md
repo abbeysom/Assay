@@ -98,6 +98,20 @@ every output — report, evidence lines, preimage — prints, so the bytes
 `<network>` segment is not checked: which ledger the scan reads is settled by
 the scanner's network binding (#41), not by the address bar.
 
+### The Horizon endpoint (`-horizon`)
+
+`scan`, `attestation` and `serve` take `-horizon URL` to choose the Horizon
+server they read from. The flag overrides the `ASSAY_HORIZON_URL` environment
+variable, which in turn overrides the public default
+(`https://horizon.stellar.org`). Evidence URLs in the report name the endpoint
+that actually answered, so a report produced against a private Horizon says so.
+
+```
+./assay scan -horizon https://horizon.example.org CODE-ISSUER
+./assay attestation -horizon https://horizon.example.org CODE-ISSUER
+./assay serve -addr :8080 -horizon https://horizon.example.org
+```
+
 ## assay scan
 
 Scans one asset and prints the full report: the findings, the reasoning behind

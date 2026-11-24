@@ -8,7 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/use-assay/assay/internal/stellarexpert"
 )
@@ -219,27 +222,78 @@ func TestRetryRetryAfterIsHonoured(t *testing.T) {
 	}
 }
 
-// TestRetryRetryAfterNumeric verifies the client honours Retry-After with a
-// numeric delay value (the most common form observed on api.stellar.expert).
+// serveRetryAfter answers 429 with the given Retry-After header until okAfter
+// requests have been refused, then 200 with a listing. okAfter < 0 never
+// recovers. It returns the client and a counter of requests received.
+func serveRetryAfter(t *testing.T, retryAfter string, okAfter int) (*stellarexpert.Client, *atomic.Int32) {
+	t.Helper()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := int(hits.Add(1))
+		if okAfter >= 0 && n > okAfter {
+			_, _ = w.Write([]byte(bodyListed))
+			return
+		}
+		w.Header().Set("Retry-After", retryAfter)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+	return stellarexpert.New(srv.URL), &hits
+}
+
+const retryAfterAsset = "GAROH4EV3WVVTRQKEY43GZK3XSRBEYETRVZ7SVG5LHWOAANSMCTJBB3U"
+
+// TestRetryRetryAfterNumeric sends a numeric Retry-After on the 429 and asserts
+// the client reissued the request exactly once and then succeeded. The wait is
+// capped by the retry options' MaxDelay, so a large advertised value never
+// stalls a scan past its budget.
 func TestRetryRetryAfterNumeric(t *testing.T) {
-	// 429 with Retry-After: 5, then 200.
-	c := serveSequence(t, []int{http.StatusTooManyRequests, http.StatusOK}, []string{`{}`, bodyListed})
-	// The client honours Retry-After when present (numeric form), so the
-	// request must have been reissued after the delay.
-	if _, err := c.Directory(context.Background(), "GAROH4EV3WVVTRQKEY43GZK3XSRBEYETRVZ7SVG5LHWOAANSMCTJBB3U"); err != nil {
+	c, hits := serveRetryAfter(t, "5", 1)
+	start := time.Now()
+	if _, err := c.Directory(context.Background(), retryAfterAsset); err != nil {
 		t.Fatalf("Directory after Retry-After (numeric): %v", err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("requests = %d, want 2 (one 429, one retry)", got)
+	}
+	if d := time.Since(start); d >= 5*time.Second {
+		t.Errorf("waited %v: the retry must be capped well below an advertised 5s Retry-After", d)
 	}
 }
 
-// TestRetryRetryAfterRFC1123 verifies the client honours Retry-After with an
-// RFC1123-formatted timestamp.
+// TestRetryRetryAfterRFC1123 does the same with an HTTP-date Retry-After.
 func TestRetryRetryAfterRFC1123(t *testing.T) {
-	// 429 with Retry-After, then 200.
-	c := serveSequence(t, []int{http.StatusTooManyRequests, http.StatusOK}, []string{`{}`, bodyListed})
-	// The client honours Retry-After when present (RFC1123 form), so the
-	// request must have been reissued after the delay.
-	if _, err := c.Directory(context.Background(), "GAROH4EV3WVVTRQKEY43GZK3XSRBEYETRVZ7SVG5LHWOAANSMCTJBB3U"); err != nil {
+	when := time.Now().UTC().Add(3 * time.Second).Format(time.RFC1123)
+	c, hits := serveRetryAfter(t, when, 1)
+	if _, err := c.Directory(context.Background(), retryAfterAsset); err != nil {
 		t.Fatalf("Directory after Retry-After (RFC1123): %v", err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("requests = %d, want 2 (one 429, one retry)", got)
+	}
+}
+
+// TestRetryAfterHintIsRecordedWhenBudgetIsExceeded asserts that when every
+// attempt is refused, the error the caller records as evidence carries the
+// server's Retry-After hint, in both header forms.
+func TestRetryAfterHintIsRecordedWhenBudgetIsExceeded(t *testing.T) {
+	for name, header := range map[string]string{
+		"numeric": "7",
+		"rfc1123": time.Now().UTC().Add(30 * time.Second).Format(time.RFC1123),
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, hits := serveRetryAfter(t, header, -1)
+			_, err := c.Directory(context.Background(), retryAfterAsset)
+			if err == nil {
+				t.Fatal("a source that always answers 429 must fail once the retries are spent")
+			}
+			if !strings.Contains(err.Error(), "status 429") || !strings.Contains(err.Error(), "Retry-After:") {
+				t.Errorf("error must name the 429 and carry the Retry-After hint, got: %v", err)
+			}
+			if got := hits.Load(); got != int32(stellarexpert.DefaultRetryOptions().Attempts) {
+				t.Errorf("requests = %d, want %d (the attempt budget)", got, stellarexpert.DefaultRetryOptions().Attempts)
+			}
+		})
 	}
 }
 

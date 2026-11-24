@@ -71,7 +71,10 @@ type Server struct {
 	eventsClients map[chan []byte]struct{}
 	// eventsMu protects eventsClients.
 	eventsMu sync.Mutex
-	Log      *slog.Logger
+	// instrumentOnce makes Handler idempotent about wrapping the scanner's
+	// transports with latency timing.
+	instrumentOnce sync.Once
+	Log            *slog.Logger
 }
 
 // NewServer returns a Server backed by the production scanner and an in-memory
@@ -103,6 +106,7 @@ var Routes = []string{
 // per-request logger — the correlation the outcome log line depends on is
 // installed once, here, rather than remembered per handler.
 func (s *Server) Handler() http.Handler {
+	s.instrumentOnce.Do(s.instrumentSources)
 	// Build the prober once after callers have had a chance to configure the
 	// scanner and registry reader. Rebuilding it per request would bypass its
 	// cache and turn /readyz scrapes into upstream and RPC traffic.

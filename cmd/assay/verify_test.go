@@ -3,13 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/use-assay/assay/internal/attest"
+	"github.com/use-assay/assay/internal/differential"
 	"github.com/use-assay/assay/internal/mechanics"
+	"github.com/use-assay/assay/internal/registry"
+	"github.com/use-assay/assay/internal/sac"
 )
 
 func TestVerifyTextNamesNetwork(t *testing.T) {
@@ -285,6 +290,61 @@ func TestVerifyExitCodeMapping(t *testing.T) {
 	}
 }
 
+// TestVerifyChainSideHasNoPreimageVersion asserts that neither the JSON nor the
+// human-readable output includes a preimage_version field for the chain side.
+// The registry does not store a preimage version — reporting a zero default
+// would be a fabricated fact. The local side already carries the encoding in
+// LocalSide.Encoding; the chain side carries only what the chain actually stored.
+func TestVerifyChainSideHasNoPreimageVersion(t *testing.T) {
+	asset := mechanics.Asset{Code: verifyTestAssetCode, Issuer: verifyTestAssetIssuer}
+	rep, params := attestableReport(t, nil)
+	chain := chainFrom(params, verifyTableTime.Add(-time.Hour).Unix(), false)
+
+	res, err := verifyAsset(context.Background(), asset, 0, verifyTableTime,
+		func(context.Context, mechanics.Asset) (*mechanics.Report, *mechanics.Subject, error) {
+			return rep, nil, nil
+		},
+		func(mechanics.Asset) (*OnChainSafety, error) { return chain, nil }, "")
+	if err != nil {
+		t.Fatalf("verifyAsset: %v", err)
+	}
+	if res.Outcome != outcomeAgree {
+		t.Fatalf("unexpected outcome %s", res.Outcome)
+	}
+
+	// JSON output must not carry preimage_version on the chain side.
+	var buf bytes.Buffer
+	if err := writeVerifyResult(&buf, res, true); err != nil {
+		t.Fatalf("writeVerifyResult json: %v", err)
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("unmarshal json: %v", err)
+	}
+	if chainDoc, ok := doc["chain"].(map[string]interface{}); ok {
+		if _, hasVersion := chainDoc["preimage_version"]; hasVersion {
+			t.Error("JSON chain side must not contain preimage_version: the registry does not store it")
+		}
+	}
+
+	// Human output must not contain "preimage_version" at all.
+	buf.Reset()
+	// Force the mismatch branch so the chain side is printed in human output.
+	chain2 := chainFrom(params, verifyTableTime.Add(-time.Hour).Unix(), false)
+	chain2.Severity = 99
+	res2, _ := verifyAsset(context.Background(), asset, 0, verifyTableTime,
+		func(context.Context, mechanics.Asset) (*mechanics.Report, *mechanics.Subject, error) {
+			return rep, nil, nil
+		},
+		func(mechanics.Asset) (*OnChainSafety, error) { return chain2, nil }, "")
+	if err := writeVerifyResult(&buf, res2, false); err != nil {
+		t.Fatalf("writeVerifyResult text: %v", err)
+	}
+	if strings.Contains(buf.String(), "preimage_version") {
+		t.Errorf("human output must not contain preimage_version:\n%s", buf.String())
+	}
+}
+
 // TestVerifyScanErrorIsInfrastructure makes the distinction the design
 // comment claims: a failing scan or chain read is an error return (no
 // verdict), while every outcome class is a successful verification of a
@@ -363,5 +423,114 @@ func TestVerifyMatchesAnOlderEncoding(t *testing.T) {
 	if res.Outcome != outcomeMismatch || res.Local.Encoding != attest.PreimageVersionScanner {
 		t.Fatalf("changed evidence: outcome %s, encoding %s; want mismatch reported under v4",
 			res.Outcome, res.Local.Encoding)
+	}
+}
+
+// TestVerifyPreimageVersionAbsent asserts that the JSON output for a chain
+// side never includes "preimage_version", since the registry does not store it
+// and a zero default would be presented as a fact (issue #558).
+func TestVerifyPreimageVersionAbsent(t *testing.T) {
+	_, params := attestableReport(t, nil)
+	res := &VerifyResult{
+		Asset:   verifyTestAssetCode + "-" + verifyTestAssetIssuer,
+		Outcome: outcomeMismatch,
+		Fields:  []string{"severity"},
+		Chain: &OnChainSafety{
+			Severity:     params.Severity + 1,
+			Flags:        params.Flags,
+			EvidenceHash: params.EvidenceHash,
+			AttestedAt:   verifyTableTime.Unix(),
+		},
+	}
+	var buf bytes.Buffer
+	if err := writeVerifyResult(&buf, res, true); err != nil {
+		t.Fatalf("writeVerifyResult: %v", err)
+	}
+	if strings.Contains(buf.String(), "preimage_version") {
+		t.Errorf("JSON output must not contain preimage_version; got:\n%s", buf.String())
+	}
+}
+
+func TestVerifyDerivesSACInProcessPinned(t *testing.T) {
+	// Pinned AQUA vectors from internal/sac/sac_test.go
+	const code = "AQUA"
+	const issuer = "GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA"
+	const wantTestnet = "CDJF2JQINO7WRFXB2AAHLONFDPPI4M3W2UM5THGQQ7JMJDIEJYC4CMPG"
+	const wantPubnet = "CAUIKL3IYGMERDRUN6YSCLWVAKIFG5Q4YJHUKM4S4NJZQIA3BAS6OJPK"
+
+	testnetSAC, err := sac.Address(code, issuer, sac.Passphrase("testnet"))
+	if err != nil {
+		t.Fatalf("testnet derive: %v", err)
+	}
+	if testnetSAC != wantTestnet {
+		t.Errorf("AQUA testnet = %s, want %s", testnetSAC, wantTestnet)
+	}
+
+	pubnetSAC, err := sac.Address(code, issuer, sac.Passphrase("pubnet"))
+	if err != nil {
+		t.Fatalf("pubnet derive: %v", err)
+	}
+	if pubnetSAC != wantPubnet {
+		t.Errorf("AQUA pubnet = %s, want %s", pubnetSAC, wantPubnet)
+	}
+}
+
+func TestVerifyRegistryFlagsParsed(t *testing.T) {
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	registryRPC := fs.String("registry-rpc", envOr("ASSAY_RPC_URL", registry.DefaultRPCURL),
+		"Soroban RPC endpoint for the registry (env ASSAY_RPC_URL)")
+	contractID := fs.String("contract", envOr("ASSAY_CONTRACT_ID", registry.DefaultContractID),
+		"registry contract id (env ASSAY_CONTRACT_ID)")
+	network := fs.String("network", envOr("ASSAY_NETWORK", "testnet"),
+		"network used to derive the SAC id (env ASSAY_NETWORK)")
+	rpcURL := fs.String("rpc", differential.DefaultURL,
+		"Soroban RPC URL used by -differential (distinct from -registry-rpc)")
+
+	err := fs.Parse([]string{
+		"-registry-rpc", "https://custom-rpc.example.com",
+		"-contract", "CDJF2JQINO7WRFXB2AAHLONFDPPI4M3W2UM5THGQQ7JMJDIEJYC4CMPG",
+		"-network", "pubnet",
+		"-rpc", "https://diff-rpc.example.com",
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if *registryRPC != "https://custom-rpc.example.com" {
+		t.Errorf("registry-rpc = %s", *registryRPC)
+	}
+	if *contractID != "CDJF2JQINO7WRFXB2AAHLONFDPPI4M3W2UM5THGQQ7JMJDIEJYC4CMPG" {
+		t.Errorf("contract = %s", *contractID)
+	}
+	if *network != "pubnet" {
+		t.Errorf("network = %s", *network)
+	}
+	if *rpcURL != "https://diff-rpc.example.com" {
+		t.Errorf("rpc = %s", *rpcURL)
+	}
+}
+
+func TestVerifyAndRegistryHistoryShareRegistryFlags(t *testing.T) {
+	old := flagSetOutput
+	var buf bytes.Buffer
+	flagSetOutput = &buf
+	t.Cleanup(func() { flagSetOutput = old })
+
+	// Check flags registered by verify on -h
+	_ = runVerify([]string{"-h"})
+	verifyHelp := buf.String()
+	buf.Reset()
+
+	// Check flags registered by registry-history on -h
+	_ = runRegistryHistory([]string{"-h"}, commandDeps{stderr: &buf})
+	historyHelp := buf.String()
+
+	registryFlags := []string{"-registry-rpc", "-contract", "-network"}
+	for _, flag := range registryFlags {
+		if !strings.Contains(verifyHelp, flag) {
+			t.Errorf("verify does not register registry flag %s", flag)
+		}
+		if !strings.Contains(historyHelp, flag) {
+			t.Errorf("registry-history does not register registry flag %s", flag)
+		}
 	}
 }

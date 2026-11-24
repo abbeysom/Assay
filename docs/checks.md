@@ -14,6 +14,7 @@ nowhere to put one.
 type Check interface {
     ID() string
     Describe() string
+    Inputs() []string // Subject fields the check reads
     Run(ctx context.Context, s *Subject) (Finding, error)
 }
 ```
@@ -82,6 +83,13 @@ not a live capture, because no disagreeing asset has ever been observed.
 existing holder is exposed (clawback is inherited at trustline creation, so this
 answers the prospective question only); or anything about who the issuer is.
 
+If either Horizon copy reports `auth_clawback_enabled=true` without
+`auth_revocable=true`, the combination is impossible under
+[CAP-0035](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0035.md).
+It is treated as a broken, lagging, or hostile source fault rather than scored:
+the capability finding is undetermined, its reasoning names the bad copy, and
+the asset and issuer-account URLs are both cited.
+
 ## `mutability`
 
 **Concludes:** whether the issuer's authorization flag set can still change.
@@ -100,11 +108,13 @@ number. There are three states, each with its own reasoning:
   given up, because `AUTH_IMMUTABLE_FLAG` cannot be cleared once set (CAP-0035
   makes all `AUTH_*` flags read-only). Locking does not make the power safer; it
   removes any future in which the issuer relinquishes it.
-- **Not locked** — the issuer may add freeze or confiscation later. Under
-  CAP-0035 a flag added later does not reach trustlines that already exist, but
-  it applies to any trustline opened after the change. This is the state a
-  prospective holder wants surfaced, because it is the one where today's `clear`
-  is not a durable answer.
+- **Not locked** — the issuer may add freeze or confiscation later. Adding
+  `auth_revocable` would immediately allow the issuer to freeze existing
+  trustlines; existing holders are exposed as soon as the flag is set. Adding
+  `auth_clawback_enabled` under CAP-0035 applies only to trustlines opened after
+  the change and does not reach trustlines that already exist. Either way this is
+  the state a prospective holder wants surfaced, because it is the one where
+  today's `clear` is not a durable answer.
 
 **Flag source.** The check reads the issuer flags from the same Horizon
 `/assets` record the `capability` check derives severity from, so the two

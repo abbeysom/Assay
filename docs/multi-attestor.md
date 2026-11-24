@@ -1,14 +1,14 @@
 # Multi-attestor writes
 
-**Status: design, for review. Nothing here is implemented.** This document
-answers [#88](https://github.com/use-assay/Assay/issues/88). It compares ways
-to remove the single-admin trust root, says what each costs, and recommends
-one. Implementation is filed separately once a scheme is agreed. The contract
-is not changed by this document.
+**Status: Scheme C is implemented in the registry.** This document answers
+[#88](https://github.com/use-assay/Assay/issues/88), records the design
+rationale, and compares the alternatives and their costs. The implementation
+lives in the safety registry; this document does not change its contract.
 
 ## The problem
 
-Today `init` sets one admin, and `attest` and `revoke` accept only that admin.
+Before Scheme C, `init` set one admin, and `attest` and `revoke` accepted only
+that admin.
 A consumer calling `is_safe` is trusting one ed25519 key on one machine
 ([deployment.md](deployment.md#what-this-deployment-is-not)). That is the
 largest single trust assumption in Assay, and it is what has to change before
@@ -65,8 +65,9 @@ they mean different things:
 | State | Condition | Gate result | What it means operationally |
 | --- | --- | --- | --- |
 | **Met** | At least M responding attestors, and the aggregation rule produces a result | Admit or refuse on that result | Normal |
-| **Unavailable** | Fewer than M responding | Refuse | A liveness problem: attestors are down, slow, or have stopped. Nothing is wrong with the claims. |
+| **Unavailable** | A valid call, with fewer than M responding | Refuse | A liveness problem: attestors are down, slow, or have stopped. Nothing is wrong with the claims. |
 | **Contested** | At least M responding, but they do not agree as the rule requires | Refuse | Something is wrong with a claim. An attestor is buggy, compromised, or running a different check set, or the issuer changed flags between two scans. It needs a human. |
+| **InvalidArguments** | The call itself is malformed: M is 0, M exceeds the distinct attestors, or there are more than `MAX_ATTESTORS` | Refuse | A consumer bug, not an outage. No attestor was read; waiting will not help, the caller must fix its call. |
 
 Both non-Met states fail closed. They must be distinguishable to an observer,
 because one needs waiting and the other needs investigation. A registry that
@@ -150,6 +151,7 @@ pub enum Quorum {
     Met(Safety),                             // aggregated, see below
     Unavailable(u32),                        // responding count, < threshold
     Contested(u32),                          // responding count, >= threshold
+    InvalidArguments,                        // malformed call: threshold == 0, threshold > distinct attestors, or more than MAX_ATTESTORS
 }
 ```
 
@@ -194,10 +196,61 @@ raised, never lowered.
   causes denial of service for every consumer that names it, visibly. Anyone
   can write, so storage grows with writers, but rent is paid by the writer and
   consumers read only the entries they name.
-- **Cost:** a quorum read touches up to N entries instead of one. At N ≤ 5 this
-  is small next to the call it protects, but it must be measured against the
-  Soroban read budget before an ABI is fixed. Each attestor pays its own rent
-  and TTL extension ([deployment.md](deployment.md#entry-lifetime)).
+- **Cost:** a quorum read touches up to N entries instead of one. The read
+  budget was measured at N = 1, 2, 4, 8, and 16 in the prototype below. Each
+  attestor pays its own rent and TTL extension
+  ([deployment.md](deployment.md#entry-lifetime)).
+
+## Scheme C read-budget prototype
+
+Measured 2026-11-24 with `soroban-sdk` 28.0.0's `Env::cost_estimate()` after
+each top-level `quorum` invocation. The scratch contract at
+[`assay-contracts/scratch/quorum-budget`](../assay-contracts/scratch/quorum-budget)
+uses the proposed persistent `(attestor, asset)` key, stores the same fields
+as `Safety` (including the 32-byte evidence hash), reads each supplied
+attestor once, and computes max severity, unioned flags, and disagreement.
+Seed writes happen before the measured invocation. Every record is present and
+fresh, so this is the all-responding path and exercises the full aggregation.
+
+| Attestors (N) | CPU instructions | Memory (bytes) | Attestation entries read | Total read entries* |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 31,559 | 4,366 | 1 | 2 |
+| 2 | 52,595 | 6,218 | 2 | 3 |
+| 4 | 94,868 | 9,997 | 4 | 5 |
+| 8 | 185,212 | 17,855 | 8 | 9 |
+| 16 | 382,433 | 34,771 | 16 | 17 |
+
+\* `total read entries` is the SDK resource count
+`disk_read_entries + memory_read_entries`; it includes one fixed entry in
+addition to the N attestation entries. The host test ledger reports these as
+memory reads (`disk_read_entries = 0`). On a network invocation, the persistent
+attestation entries are disk reads; the number of entries is unchanged.
+
+The CPU and memory figures are the SDK budget fields `instructions` and
+`mem_bytes`, not wall-clock timings or process RSS. These are per invocation
+measurements in the SDK's default test host, which enforces its configured
+invocation limits. Results describe the Scheme C read and aggregation path;
+they do not include the rest of a consumer transaction.
+
+### Recommended cap: 16 attestors
+
+Recommend a hard ABI cap of **16**. At that cap the measured call reads 17
+entries, or 4.25% of the 400-entry transaction footprint limit used by the
+current Soroban SDK limits, and consumes 0.096% of the 400,000,000-instruction
+limit and 0.083% of the 41,943,040-byte memory limit. Read entries are the
+binding resource: this cap leaves 383 footprint entries for the consumer's
+other contract calls and transaction data, while CPU and memory retain much
+more headroom. Sixteen also has a direct measurement; the cap does not assume
+that an unmeasured larger N is safe for callers.
+
+The benchmark can be rerun from `assay-contracts/` with:
+
+```sh
+cargo test --manifest-path scratch/quorum-budget/Cargo.toml -- --nocapture
+```
+
+The prototype is intentionally excluded from the deployable Cargo workspace
+and does not modify the safety registry or its ABI.
 
 ## Comparison
 
@@ -243,8 +296,8 @@ registry offers conservative max/union aggregation, and nothing else.**
 
 This is the second open question in this document, now closed. The comparison
 below is argued against concrete consumers — a vault that accepts several
-collateral assets in one call (the batch read in [#331]), and the example gate
-that admits a deposit only below a severity ceiling ([integrating.md]) — rather
+collateral assets in one call (the batch read in [#331](https://github.com/use-assay/Assay/issues/331)), and the example gate
+that admits a deposit only below a severity ceiling ([integrating.md](integrating.md)) — rather
 than in the abstract.
 
 ### Conservative max/union (offered)
@@ -256,7 +309,7 @@ observers.
 
 - **Admission risk:** low. Danger can be raised, never lowered, which is the
   same rule that already holds for severity inside one report
-  ([threat-model.md] #4). M compromised attestors cannot cause an admission as
+  ([threat-model.md](threat-model.md) #4). M compromised attestors cannot cause an admission as
   long as one honest attestor in the consumer's set is responding: the maximum
   wins. Forcing an admission requires M compromised attestors *and* every
   honest attestor to be non-responding within the window — a strictly stronger
@@ -286,7 +339,7 @@ any difference as Contested with no result.
 - **Consumer complexity:** higher. Consumers must understand agreement
   thresholds, distinguish Contested from Unavailable, and decide which
   attestor set to retry with — two rules instead of one double the surface a
-  consumer can misconfigure ([#330]).
+  consumer can misconfigure ([#330](https://github.com/use-assay/Assay/issues/330)).
 
 ### Why #153's consumer research does not change this
 

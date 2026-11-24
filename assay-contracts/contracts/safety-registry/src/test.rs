@@ -104,6 +104,29 @@ fn stale_attestation_fails_closed() {
     assert!(client.is_safe(&asset, &SEVERITY_MEDIUM, &0));
 }
 
+/// The registry's deployed contract uses zero to opt out of freshness checks
+/// on every read gate. `assay_gate::check_policy` intentionally uses a strict
+/// zero-second window instead; the cross-API difference is documented in
+/// `docs/contract-interface.md`.
+#[test]
+fn zero_max_age_disables_freshness_across_registry_gates() {
+    let (env, client, admin) = setup();
+    let asset = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    client.attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+    env.ledger().set_timestamp(1_601);
+
+    assert!(client.is_safe(&asset, &SEVERITY_CLEAR, &0));
+    assert!(client.is_safe_masked(&asset, &0, &0));
+
+    match client.quorum(&asset, &vec![&env, admin.clone()], &1, &0) {
+        Quorum::Met(safety) => assert_eq!(safety.attested_at, 1_000),
+        other => panic!("expected stale attestation to count at zero age, got {other:?}"),
+    }
+    assert!(client.is_safe_quorum(&asset, &vec![&env, admin], &1, &SEVERITY_CLEAR, &0,));
+}
+
 #[test]
 fn attestation_from_the_future_does_not_underflow() {
     let (env, client, _) = setup();
@@ -725,6 +748,164 @@ fn is_safe_property_exhaustive() {
     }
 }
 
+/// Deterministic generator for the u64-extreme property tests below.
+///
+/// A seeded generator keeps a failure reproducible without adding a property-
+/// testing dependency (and therefore without changing Cargo.lock). splitmix64
+/// is used because it is tiny, stable, and produces a different value for
+/// every call from one seed.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Draw a value from the top of the u64 range, where freshness arithmetic is
+/// most likely to wrap, with occasional small values so the same test also
+/// covers the ordinary path.
+fn extreme_u64(state: &mut u64) -> u64 {
+    match splitmix64(state) % 5 {
+        0 => u64::MAX,
+        1 => u64::MAX - 1,
+        2 => u64::MAX - 600,
+        3 => u64::MAX / 2,
+        _ => splitmix64(state) % 2_000,
+    }
+}
+
+/// Property: `is_safe` must not admit anything because freshness arithmetic
+/// wrapped. Every generated case is compared with the saturating model the
+/// contract documents. The cases deliberately include `max_age_secs` and
+/// `attested_at` at `u64::MAX`, and an `attested_at` ahead of ledger time.
+///
+/// A wrapping subtraction is never smaller than a saturating one, so a wrap
+/// can only turn a fresh attestation into a refused one, never the reverse.
+/// The explicit assertions below pin that direction: the future-attestation
+/// cases difference is safe-direction only, and the result still matches the
+/// saturating model.
+#[test]
+fn is_safe_property_u64_extremes_seeded() {
+    let (env, client, _) = setup();
+    let seed = 0x5EED_0352_0000_0001u64;
+    let mut state = seed;
+
+    for case in 0..256u32 {
+        let asset = Address::generate(&env);
+        let attested_at = extreme_u64(&mut state);
+        let max_age = extreme_u64(&mut state);
+        let now = match splitmix64(&mut state) % 6 {
+            0 => attested_at,
+            1 => attested_at.saturating_sub(1),
+            2 => attested_at.saturating_add(1),
+            3 => u64::MAX,
+            4 => u64::MAX - 1,
+            _ => splitmix64(&mut state) % 2_000,
+        };
+
+        env.ledger().set_timestamp(attested_at);
+        client.attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+        env.ledger().set_timestamp(now);
+
+        let age = now.saturating_sub(attested_at);
+        let expected = max_age == 0 || age <= max_age;
+        let actual = client.is_safe(&asset, &SEVERITY_CRITICAL, &max_age);
+
+        assert_eq!(
+            actual, expected,
+            "seed={seed:#x} case={case} attested_at={attested_at} now={now} max_age={max_age} age={age}"
+        );
+
+        // The only cases where wrapping and saturating arithmetic differ are
+        // future attestations, where wrapping yields a huge age and
+        // saturating yields zero. That difference can only refuse more, so
+        // no admission is attributable to a wrap.
+        let wrapped_age = now.wrapping_sub(attested_at);
+        if wrapped_age != age {
+            assert!(
+                now < attested_at,
+                "seed={seed:#x} case={case} unexpected wrap direction"
+            );
+            assert!(
+                wrapped_age > age,
+                "seed={seed:#x} case={case} wrap was smaller than saturating age"
+            );
+            assert_eq!(
+                actual, expected,
+                "seed={seed:#x} case={case} wrap changed the answer"
+            );
+        }
+    }
+}
+
+/// The same property for `is_safe_masked`. The forbidden mask varies across the
+/// named policies as well as the arithmetic inputs, so a fresh-but-forbidden
+/// attestation must still be refused. No generated case may be admitted because
+/// of an arithmetic wrap.
+#[test]
+fn is_safe_masked_property_u64_extremes_seeded() {
+    let (env, client, _) = setup();
+    let seed = 0x5EED_0352_0000_0002u64;
+    let mut state = seed;
+    let masks = [
+        0u32,
+        POLICY_MASK_CONFISCATION_ONLY,
+        POLICY_MASK_FREEZE_INCLUSIVE,
+        u32::MAX,
+    ];
+
+    for case in 0..256u32 {
+        let asset = Address::generate(&env);
+        let attested_at = extreme_u64(&mut state);
+        let max_age = extreme_u64(&mut state);
+        let now = match splitmix64(&mut state) % 6 {
+            0 => attested_at,
+            1 => attested_at.saturating_sub(1),
+            2 => attested_at.saturating_add(1),
+            3 => u64::MAX,
+            4 => u64::MAX - 1,
+            _ => splitmix64(&mut state) % 2_000,
+        };
+        let flags = match splitmix64(&mut state) % 3 {
+            0 => 0u32,
+            1 => MECH_AUTH_REQUIRED,
+            _ => MECH_AUTH_REVOCABLE,
+        };
+        let forbidden = masks[(splitmix64(&mut state) % masks.len() as u64) as usize];
+
+        env.ledger().set_timestamp(attested_at);
+        client.attest(&asset, &SEVERITY_CLEAR, &flags, &hash(&env));
+        env.ledger().set_timestamp(now);
+
+        let age = now.saturating_sub(attested_at);
+        let fresh = max_age == 0 || age <= max_age;
+        let expected = fresh && flags & forbidden == 0;
+        let actual = client.is_safe_masked(&asset, &forbidden, &max_age);
+
+        assert_eq!(
+            actual, expected,
+            "seed={seed:#x} case={case} attested_at={attested_at} now={now} max_age={max_age} flags={flags} forbidden={forbidden} age={age}"
+        );
+
+        let wrapped_age = now.wrapping_sub(attested_at);
+        if wrapped_age != age {
+            assert!(
+                now < attested_at,
+                "seed={seed:#x} case={case} unexpected wrap direction"
+            );
+            assert!(
+                wrapped_age > age,
+                "seed={seed:#x} case={case} wrap was smaller than saturating age"
+            );
+            assert_eq!(
+                actual, expected,
+                "seed={seed:#x} case={case} wrap changed the answer"
+            );
+        }
+    }
+}
+
 /// Contract error discriminants are ABI documented in docs/integrating.md and live results.
 /// Reordering or changing discriminants silently breaks integrator error handling.
 #[test]
@@ -777,6 +958,172 @@ fn revoke_publishes_no_event_on_rejection() {
         env.events().all().filter_by_contract(&client.address),
         vec![&env, /* empty: a failed revoke must not emit an event */],
     );
+}
+
+/// revoke_many is all-or-nothing: if any asset in the batch is not currently
+/// attested, the entire batch fails with Error::NotAttested and no attestation is removed.
+#[test]
+fn revoke_many_all_or_nothing_if_one_missing() {
+    let (env, client, _) = setup();
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+    let missing = Address::generate(&env);
+
+    client.attest(&a1, &SEVERITY_CLEAR, &0, &hash(&env));
+    client.attest(&a2, &SEVERITY_CLEAR, &0, &hash(&env));
+    client.attest(&a3, &SEVERITY_CLEAR, &0, &hash(&env));
+
+    let batch = vec![&env, a1.clone(), a2.clone(), missing, a3.clone()];
+    let res = client.try_revoke_many(&batch);
+    assert_eq!(res, Err(Ok(Error::NotAttested)));
+
+    // None were removed
+    assert!(client.get_safety(&a1).is_some());
+    assert!(client.get_safety(&a2).is_some());
+    assert!(client.get_safety(&a3).is_some());
+}
+
+/// A batch larger than MAX_BATCH_SIZE is rejected with BatchTooLarge.
+#[test]
+fn revoke_many_over_cap_is_rejected() {
+    let (env, client, _) = setup();
+    let mut batch = Vec::new(&env);
+    for _ in 0..MAX_BATCH_SIZE + 1 {
+        batch.push_back(Address::generate(&env));
+    }
+    let res = client.try_revoke_many(&batch);
+    assert_eq!(res, Err(Ok(Error::BatchTooLarge)));
+}
+
+/// revoke_many emits exactly one Revoked event per revoked asset.
+#[test]
+fn revoke_many_emits_one_event_per_element() {
+    let (env, client, _) = setup();
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+
+    client.attest(&a1, &SEVERITY_CLEAR, &0, &hash(&env));
+    client.attest(&a2, &SEVERITY_CLEAR, &0, &hash(&env));
+
+    env.ledger().set_timestamp(9_999);
+    let batch = vec![&env, a1.clone(), a2.clone()];
+    client.revoke_many(&batch);
+
+    let mut d1 = Map::<Symbol, soroban_sdk::Val>::new(&env);
+    d1.set(Symbol::new(&env, "revoked_at"), 9_999u64.into_val(&env));
+    let mut d2 = Map::<Symbol, soroban_sdk::Val>::new(&env);
+    d2.set(Symbol::new(&env, "revoked_at"), 9_999u64.into_val(&env));
+
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("revoke"), a1).into_val(&env),
+                d1.into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (symbol_short!("revoke"), a2).into_val(&env),
+                d2.into_val(&env),
+            ),
+        ],
+    );
+}
+
+/// An empty batch succeeds and writes nothing.
+#[test]
+fn revoke_many_empty_batch_succeeds_and_does_nothing() {
+    let (env, client, _) = setup();
+    let empty = Vec::new(&env);
+    client.revoke_many(&empty);
+
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        vec![&env],
+    );
+}
+
+#[test]
+fn revoke_many_before_init_returns_not_initialized() {
+    let env = Env::default();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+
+    let res = client.try_revoke_many(&Vec::new(&env));
+    assert_eq!(res, Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn revoke_many_rejects_unauthorized_caller() {
+    let env = Env::default();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let caller = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let batch = vec![&env, asset.clone()];
+
+    let err = client
+        .mock_auths(&[MockAuth {
+            address: &caller,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "revoke_many",
+                args: (&batch,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_revoke_many(&batch)
+        .expect_err("non-admin must be rejected");
+
+    assert!(err.is_err());
+}
+
+/// A batch of exactly MAX_BATCH_SIZE is accepted and extends the instance TTL.
+#[test]
+fn revoke_many_size_bound_is_measured_and_holds_headroom() {
+    let (env, client, _) = setup();
+    let mut batch = Vec::new(&env);
+    for _ in 0..MAX_BATCH_SIZE {
+        let asset = Address::generate(&env);
+        client.attest(&asset, &SEVERITY_MEDIUM, &0, &hash(&env));
+        batch.push_back(asset);
+    }
+
+    client.revoke_many(&batch);
+
+    let r = env.cost_estimate().resources();
+    let footprint = r.disk_read_entries + r.memory_read_entries + r.write_entries;
+
+    assert!(
+        r.contract_events_size_bytes <= 16_384,
+        "event bytes {} exceed the 16 384 budget",
+        r.contract_events_size_bytes
+    );
+    assert!(
+        r.write_entries <= 200,
+        "write entries {} exceed 200",
+        r.write_entries
+    );
+    assert!(footprint <= 400, "footprint entries {footprint} exceed 400");
+    assert!(
+        r.write_bytes <= 132_096,
+        "write bytes {} exceed 132 096",
+        r.write_bytes
+    );
+    assert!(
+        r.instructions <= 400_000_000,
+        "instructions exceed 400 000 000"
+    );
+    assert!(r.mem_bytes <= 41_943_040, "memory exceeds 41 943 040");
+
+    let max = max_ttl(&env, &client);
+    assert_eq!(instance_ttl(&env, &client), max);
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,9 +2407,50 @@ fn version_returns_interface_version() {
 /// Version 2 is the #349 change — `Error::InvalidAsset` joined the error set.
 /// Version 3 is the #284 change: the stored `Safety` gained `preimage_version`,
 /// so a reader can tell which evidence encoding its `evidence_hash` used.
+/// Version 4 is the #567 change: `Quorum::InvalidArguments` joined the enum.
 #[test]
 fn interface_version_is_abi() {
-    assert_eq!(INTERFACE_VERSION, 3);
+    assert_eq!(INTERFACE_VERSION, 4);
+}
+
+/// A bump that is not recorded leaves a consumer holding `version() == N` with
+/// no way to learn what N changed. The rustdoc on `INTERFACE_VERSION` points at
+/// the doc's version history, so this test holds the two together: every
+/// version up to and including the constant must have a row there.
+#[test]
+fn interface_version_history_is_documented() {
+    const DOC: &str = include_str!("../../../../docs/contract-interface.md");
+    let after_heading = DOC
+        .split_once("### Version history")
+        .expect("docs/contract-interface.md has no \"### Version history\" section")
+        .1;
+    let section = after_heading
+        .split("\n### ")
+        .next()
+        .unwrap_or(after_heading);
+
+    // Version rows are the table rows whose first cell is the version number.
+    // Other tables in the section (the error-code table follows it) do not
+    // start with a numeric first cell, so they are ignored.
+    let mut documented: std::vec::Vec<u32> = std::vec::Vec::new();
+    for line in section.lines() {
+        let Some(cells) = line.strip_prefix("| ") else {
+            continue;
+        };
+        let Some((first, _)) = cells.split_once(" |") else {
+            continue;
+        };
+        if let Ok(version) = first.trim().parse::<u32>() {
+            documented.push(version);
+        }
+    }
+
+    for version in 1..=INTERFACE_VERSION {
+        assert!(
+            documented.contains(&version),
+            "INTERFACE_VERSION is {INTERFACE_VERSION}, but version {version} has no row in the version history in docs/contract-interface.md"
+        );
+    }
 }
 
 /// Results come back in the order the assets were asked for, and an asset that
@@ -2336,7 +2724,7 @@ fn quorum_deduplicates_attestors_and_cannot_inflate_threshold() {
     // If threshold is 2, a duplicated single attestor cannot satisfy it.
     let attestors = vec![&env, admin.clone(), admin.clone(), admin.clone()];
     let res = client.quorum(&asset, &attestors, &2, &0);
-    assert_eq!(res, Quorum::Unavailable(0));
+    assert_eq!(res, Quorum::InvalidArguments);
 
     // Threshold 1 passes with the deduplicated single attestor
     let res1 = client.quorum(&asset, &attestors, &1, &0);
@@ -2349,6 +2737,95 @@ fn quorum_deduplicates_attestors_and_cannot_inflate_threshold() {
             attested_at: env.ledger().timestamp(),
             preimage_version: 4,
         })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #567: invalid arguments are distinguishable from zero responders
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quorum_zero_threshold_is_invalid_arguments() {
+    let (env, client, admin) = setup();
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+
+    let attestors = vec![&env, admin];
+    assert_eq!(
+        client.quorum(&asset, &attestors, &0, &0),
+        Quorum::InvalidArguments
+    );
+    assert!(!client.is_safe_quorum(&asset, &attestors, &0, &SEVERITY_CLEAR, &0));
+}
+
+#[test]
+fn quorum_threshold_above_deduplicated_set_is_invalid_arguments() {
+    let (env, client, admin) = setup();
+    let asset = Address::generate(&env);
+    let other = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+
+    // Threshold above the raw set.
+    let attestors = vec![&env, admin.clone(), other.clone()];
+    assert_eq!(
+        client.quorum(&asset, &attestors, &3, &0),
+        Quorum::InvalidArguments
+    );
+
+    // Valid for the raw list (3 entries) but too large once deduplicated (2).
+    let with_dupes = vec![&env, admin.clone(), other.clone(), admin.clone()];
+    assert_eq!(
+        client.quorum(&asset, &with_dupes, &3, &0),
+        Quorum::InvalidArguments
+    );
+    assert!(!client.is_safe_quorum(&asset, &with_dupes, &3, &SEVERITY_CLEAR, &0));
+
+    // Empty set: any non-zero threshold exceeds it.
+    let empty: Vec<Address> = Vec::new(&env);
+    assert_eq!(
+        client.quorum(&asset, &empty, &1, &0),
+        Quorum::InvalidArguments
+    );
+}
+
+#[test]
+fn quorum_set_above_max_attestors_is_invalid_arguments() {
+    let (env, client, _admin) = setup();
+    let asset = Address::generate(&env);
+
+    let mut attestors = Vec::new(&env);
+    for _ in 0..(MAX_ATTESTORS + 1) {
+        attestors.push_back(Address::generate(&env));
+    }
+    assert_eq!(attestors.len(), MAX_ATTESTORS + 1);
+
+    assert_eq!(
+        client.quorum(&asset, &attestors, &1, &0),
+        Quorum::InvalidArguments
+    );
+    assert!(!client.is_safe_quorum(&asset, &attestors, &1, &SEVERITY_CLEAR, &0));
+}
+
+/// Valid arguments with no responders stay `Unavailable(0)`, so a caller can
+/// tell "my call is wrong" (`InvalidArguments`) from "attestors are silent".
+#[test]
+fn quorum_zero_responders_is_unavailable_not_invalid_arguments() {
+    let (env, client, _admin) = setup();
+    let asset = Address::generate(&env);
+
+    let attestors = vec![&env, Address::generate(&env), Address::generate(&env)];
+    let res = client.quorum(&asset, &attestors, &1, &0);
+    assert_eq!(res, Quorum::Unavailable(0));
+    assert_ne!(res, Quorum::InvalidArguments);
+
+    // Exactly MAX_ATTESTORS distinct attestors is still a valid call.
+    let mut at_bound = Vec::new(&env);
+    for _ in 0..MAX_ATTESTORS {
+        at_bound.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        client.quorum(&asset, &at_bound, &MAX_ATTESTORS, &0),
+        Quorum::Unavailable(0)
     );
 }
 
@@ -2519,4 +2996,179 @@ fn quorum_cost_at_the_bound() {
         "instructions exceed 400 000 000"
     );
     assert!(r.mem_bytes <= 41_943_040, "memory exceeds 41 943 040");
+}
+
+// ---------------------------------------------------------------------------
+// quorum / is_safe_quorum must agree on who responds (#569)
+// ---------------------------------------------------------------------------
+
+/// Small seeded generator (splitmix64) so the property test is reproducible
+/// without a new dependency. A failing assertion prints the seed and case.
+struct SeededRng(u64);
+
+impl SeededRng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform-ish value in `0..n` (`n > 0`).
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+#[test]
+fn quorum_and_is_safe_quorum_agree_on_responders_property() {
+    const SEED: u64 = 0x5EED_0569;
+    const CASES: u64 = 200;
+    const NOW: u64 = 10_000;
+    // Larger than MAX_ATTESTORS so the over-bound path is exercised too.
+    const POOL: usize = 20;
+
+    let (env, client, _admin) = setup();
+    env.ledger().set_timestamp(NOW);
+
+    let pool: std::vec::Vec<Address> = (0..POOL).map(|_| Address::generate(&env)).collect();
+    let mut rng = SeededRng(SEED);
+
+    for case in 0..CASES {
+        let ctx = std::format!("seed={SEED:#x} case={case}");
+        let asset = Address::generate(&env);
+        let max_age_secs = if rng.below(3) == 0 {
+            0
+        } else {
+            1 + rng.below(2_000)
+        };
+
+        // Store a random attestation (or none) for each pool member. Values are
+        // written directly, so any severity/flags/age combination is reachable.
+        // Half the ages sit within one second of `max_age_secs` so the exact
+        // freshness boundary is exercised, not just far-from-it values.
+        let mut stored: std::vec::Vec<Option<Safety>> = std::vec::Vec::new();
+        for att in pool.iter() {
+            if rng.below(4) == 0 {
+                stored.push(None);
+                continue;
+            }
+            let age = if max_age_secs > 0 && rng.below(2) == 0 {
+                (max_age_secs - 1 + rng.below(3)).min(NOW)
+            } else {
+                rng.below(2_001)
+            };
+            let safety = Safety {
+                severity: rng.below(5) as u32,
+                flags: rng.below(64) as u32,
+                evidence_hash: hash(&env),
+                attested_at: NOW - age,
+                preimage_version: 4,
+            };
+            env.as_contract(&client.address, || {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Attestation(att.clone(), asset.clone()), &safety);
+            });
+            stored.push(Some(safety));
+        }
+
+        // Random attestor list, duplicates allowed, sometimes over the bound.
+        let len = rng.below(POOL as u64 + 1) as usize;
+        let mut picks: std::vec::Vec<usize> = std::vec::Vec::new();
+        let mut attestors = Vec::new(&env);
+        for _ in 0..len {
+            let idx = rng.below(POOL as u64) as usize;
+            picks.push(idx);
+            attestors.push_back(pool[idx].clone());
+        }
+        let threshold = rng.below(POOL as u64 + 2) as u32;
+        let ceiling = rng.below(5) as u32;
+
+        // Independent model of the rule.
+        let mut unique: std::vec::Vec<usize> = std::vec::Vec::new();
+        for i in picks.iter() {
+            if !unique.contains(i) {
+                unique.push(*i);
+            }
+        }
+        let in_bounds = threshold != 0
+            && threshold as usize <= unique.len()
+            && unique.len() <= MAX_ATTESTORS as usize;
+        let responders: std::vec::Vec<&Safety> = unique
+            .iter()
+            .filter_map(|i| stored[*i].as_ref())
+            .filter(|s| max_age_secs == 0 || NOW.saturating_sub(s.attested_at) <= max_age_secs)
+            .collect();
+        let count = responders.len() as u32;
+        let agg_severity = responders.iter().map(|s| s.severity).max().unwrap_or(0);
+        let agg_flags = responders.iter().fold(0u32, |f, s| f | s.flags);
+
+        // The shared routine itself counts what the model counts.
+        let shared = env.as_contract(&client.address, || {
+            SafetyRegistry::responding(&env, &asset, &attestors, threshold, max_age_secs)
+        });
+        match &shared {
+            None => assert!(!in_bounds, "responding rejected an in-bounds set; {ctx}"),
+            Some((n, list)) => {
+                assert!(in_bounds, "responding accepted an out-of-bounds set; {ctx}");
+                assert_eq!(*n, count, "responding count differs from model; {ctx}");
+                assert_eq!(list.len(), count, "responding list length differs; {ctx}");
+            }
+        }
+
+        let q = client.quorum(&asset, &attestors, &threshold, &max_age_secs);
+        let safe = client.is_safe_quorum(&asset, &attestors, &threshold, &ceiling, &max_age_secs);
+
+        // quorum reports the model's responder count wherever it reports one.
+        match &q {
+            Quorum::InvalidArguments => {
+                assert!(!in_bounds, "InvalidArguments for an in-bounds set; {ctx}");
+            }
+            Quorum::Unavailable(n) => {
+                assert!(in_bounds, "Unavailable for an out-of-bounds set; {ctx}");
+                assert_eq!(*n, count, "quorum Unavailable count; {ctx}");
+                assert!(count < threshold, "Unavailable with a quorum; {ctx}");
+            }
+            Quorum::Contested(n) => {
+                assert!(
+                    in_bounds && count >= threshold,
+                    "Contested without quorum; {ctx}"
+                );
+                assert_eq!(*n, count, "quorum Contested count; {ctx}");
+            }
+            Quorum::Met(s) => {
+                assert!(in_bounds && count >= threshold, "Met without quorum; {ctx}");
+                assert_eq!(s.severity, agg_severity, "Met severity; {ctx}");
+                assert_eq!(s.flags, agg_flags, "Met flags; {ctx}");
+            }
+        }
+        let has_quorum = matches!(q, Quorum::Met(_) | Quorum::Contested(_));
+
+        // is_safe_quorum counts the same responders: with the most permissive
+        // ceiling it is true exactly when quorum has a quorum.
+        let permissive = client.is_safe_quorum(
+            &asset,
+            &attestors,
+            &threshold,
+            &SEVERITY_CRITICAL,
+            &max_age_secs,
+        );
+        assert_eq!(permissive, has_quorum, "responder counts disagree; {ctx}");
+
+        // is_safe_quorum is true only when quorum is Met or Contested and the
+        // conservative aggregate is inside the ceiling.
+        let inside_ceiling = agg_severity <= ceiling
+            && !(agg_flags & CONFISCATION_MASK != 0 && ceiling < SEVERITY_HIGH);
+        if safe {
+            assert!(has_quorum, "safe without Met/Contested; {ctx}");
+            assert!(inside_ceiling, "safe outside the ceiling; {ctx}");
+        }
+        assert_eq!(
+            safe,
+            has_quorum && inside_ceiling,
+            "is_safe_quorum vs model; {ctx}"
+        );
+    }
 }

@@ -26,6 +26,31 @@ func (DomainCheck) Describe() string {
 		"not safety: it never raises or lowers severity."
 }
 
+// Inputs implements Check.
+//
+// Issuer supplies home_domain (and its fetch time for a mismatch citation),
+// Toml is the fetched document, and Directory contributes only the
+// domain-mismatch branch.
+func (DomainCheck) Inputs() []string {
+	return []string{
+		"Asset",
+		"HorizonURL",
+		"Issuer",
+		"IssuerFetchedAt",
+		"IssuerLedger",
+		"Toml",
+		"TomlURL",
+		"TomlErr",
+		"TomlRefused",
+		"TomlAttemptedAt",
+		"TomlLinked",
+		"Directory",
+		"DirectoryURL",
+		"DirectoryFetchedAt",
+		"Network",
+	}
+}
+
 // Run implements Check.
 //
 // Verification requires both directions to agree. The account advertises a
@@ -80,7 +105,7 @@ func (c DomainCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 		acctLedger := s.issuerLedger()
 		f.Evidence = append(f.Evidence, Evidence{
 			Source:         "horizon",
-			URL:            horizonAccountURL(s.Asset.Issuer, s.HorizonBaseURL),
+			URL:            s.horizonAccountURL(s.Asset.Issuer),
 			Claim:          fmt.Sprintf("home_domain %q", domain),
 			RetrievedAt:    NewCanonicalTime(s.IssuerFetchedAt),
 			LatestLedger:   acctLedger,

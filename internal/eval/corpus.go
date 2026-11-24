@@ -84,6 +84,9 @@ var subjectDirs = []string{
 	"doge-reputation-outage",
 	"velo-no-home-domain",
 	"synthetic-redirect-off-host",
+	"synthetic-auth-required-gating",
+	"synthetic-code-claimed-different-issuer",
+	"synthetic-merged-issuer",
 }
 
 // metadataSchemaVersion is the schema_version Corpus accepts. It is pinned

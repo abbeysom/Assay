@@ -88,10 +88,22 @@ pub const POLICY_MASK_FREEZE_INCLUSIVE: u32 = MECH_AUTH_REVOCABLE | MECH_CLAWBAC
 ///
 /// Bump this whenever the entrypoint set, the [`Safety`] or [`Attestation`]
 /// shapes, the error codes, or the event schema change. Additive read-only
-/// entrypoints do not require a bump; removing or renaming one does. Version 1
-/// established the interface with [`Self::version`]; version 2 adds
-/// [`Self::cancel_admin_transfer`] and the [`AdminTransferCancelled`] event.
-pub const INTERFACE_VERSION: u32 = 3;
+/// entrypoints do not require a bump; removing or renaming one does. Each bump
+/// is recorded in `docs/contract-interface.md` ("Interface versioning"), and a
+/// test fails if the constant runs ahead of that history.
+///
+/// Version 1 established the interface with [`Self::version`]. Version 2 adds
+/// [`Self::cancel_admin_transfer`] and the [`AdminTransferCancelled`] event,
+/// plus [`Error::InvalidAsset`], which `attest` and `attest_many` return for an
+/// address that cannot name a SAC. Version 3 adds `preimage_version` to the
+/// stored [`Safety`], written by [`Self::attest`] and [`Self::attest_many`], so
+/// a verifier can tell which encoding produced its `evidence_hash`. Version 4
+/// adds [`Quorum::InvalidArguments`], so a miscalibrated
+/// [`SafetyRegistry::quorum`] call is no longer reported as
+/// [`Quorum::Unavailable`] (an outage). A `match` on [`Quorum`] that was
+/// exhaustive under version 3 no longer compiles, and a consumer decoding the
+/// enum must learn the new case.
+pub const INTERFACE_VERSION: u32 = 4;
 
 /// Event emitted on every successful `attest` write. Rejected attestations
 /// (`InvalidSeverity`, `InconsistentAttestation`, unauthorized caller) publish
@@ -160,6 +172,13 @@ pub enum Quorum {
     /// Contested: at least `threshold` attestors responded within `max_age_secs`, but they
     /// disagree on severity or flags. The payload is the count of responding attestors.
     Contested(u32),
+    /// InvalidArguments: the call itself was malformed, so no attestor was consulted.
+    /// Returned when `threshold == 0`, when `threshold` exceeds the number of distinct
+    /// attestors, or when the distinct attestor set is larger than [`MAX_ATTESTORS`].
+    /// Unlike `Unavailable` this is not a liveness problem: waiting will not help and
+    /// the caller must fix its own call. It is appended last so the existing variants
+    /// keep their encoding.
+    InvalidArguments,
 }
 
 /// Event emitted when the current admin withdraws a pending admin transfer.
@@ -852,6 +871,55 @@ impl SafetyRegistry {
         Ok(())
     }
 
+    /// Withdraws a batch of attestations in a single transaction, restoring the
+    /// never-attested state for each asset.
+    ///
+    /// It is admin-only, capped at [`MAX_BATCH_SIZE`], and enforces all-or-nothing
+    /// execution: if any asset in `assets` has no attestation, the call returns
+    /// [`Error::NotAttested`] and nothing is removed.
+    ///
+    /// Empty batches succeed and do nothing. For non-empty batches, one [`Revoked`]
+    /// event is published per asset, and the contract instance TTL is extended.
+    pub fn revoke_many(env: Env, assets: Vec<Address>) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        if assets.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        // Phase one: validate every element before anything is removed.
+        // If any asset is missing an attestation, return NotAttested and remove nothing.
+        for asset in assets.iter() {
+            let key = DataKey::Safety(asset.clone());
+            if !env.storage().persistent().has(&key) {
+                return Err(Error::NotAttested);
+            }
+        }
+
+        if assets.is_empty() {
+            return Ok(());
+        }
+
+        // Phase two: remove all attestations and publish one Revoked event per asset.
+        let revoked_at = env.ledger().timestamp();
+        for asset in assets.iter() {
+            let key = DataKey::Safety(asset.clone());
+            env.storage().persistent().remove(&key);
+            Revoked {
+                asset: asset.clone(),
+                revoked_at,
+            }
+            .publish(&env);
+        }
+        extend_instance(&env);
+        Ok(())
+    }
+
     /// Reads the attestation for `asset`.
     ///
     /// Returns `None` when the asset has never been attested. That case is
@@ -1019,22 +1087,23 @@ impl SafetyRegistry {
         None
     }
 
-    /// Evaluates quorum across a consumer-chosen set of `attestors` for `asset`.
+    /// The one place that decides who counts as responding in a quorum read.
     ///
-    /// Attestors are deduplicated before evaluation.
-    /// Returns:
-    /// - `Quorum::Unavailable(responding_count)` if responding_count < threshold, or threshold == 0, or threshold > deduplicated_attestors.len(), or deduplicated_attestors.len() > MAX_ATTESTORS
-    /// - `Quorum::Contested(responding_count)` if responding_count >= threshold, but responding attestors differ in severity or flags
-    /// - `Quorum::Met(Safety)` if responding_count >= threshold and responding attestors agree on severity and flags
-    pub fn quorum(
-        env: Env,
-        asset: Address,
-        attestors: Vec<Address>,
+    /// Deduplicates `attestors` (first occurrence wins, order preserved), rejects
+    /// the set with `None` when `threshold` is 0, exceeds the deduplicated size,
+    /// or the deduplicated size exceeds `MAX_ATTESTORS` (no storage is read in
+    /// that case), then keeps every attestation that is fresh: `max_age_secs == 0`
+    /// disables the age check. Returns the responding count and the responding
+    /// attestations in deduplicated-attestor order. `quorum` and
+    /// `is_safe_quorum` differ only in how they aggregate that list.
+    fn responding(
+        env: &Env,
+        asset: &Address,
+        attestors: &Vec<Address>,
         threshold: u32,
         max_age_secs: u64,
-    ) -> Quorum {
-        // Deduplicate attestors
-        let mut deduped = Vec::new(&env);
+    ) -> Option<(u32, Vec<Safety>)> {
+        let mut deduped = Vec::new(env);
         for a in attestors.iter() {
             let mut found = false;
             for d in deduped.iter() {
@@ -1050,11 +1119,43 @@ impl SafetyRegistry {
 
         let deduped_len = deduped.len();
         if threshold == 0 || threshold > deduped_len || deduped_len > MAX_ATTESTORS {
-            return Quorum::Unavailable(0);
+            return None;
         }
 
         let now = env.ledger().timestamp();
-        let mut responding_count = 0u32;
+        let mut responses = Vec::new(env);
+        for attestor in deduped.iter() {
+            if let Some(s) = Self::get_attestation(env.clone(), attestor, asset.clone()) {
+                if max_age_secs == 0 || now.saturating_sub(s.attested_at) <= max_age_secs {
+                    responses.push_back(s);
+                }
+            }
+        }
+
+        Some((responses.len(), responses))
+    }
+
+    /// Evaluates quorum across a consumer-chosen set of `attestors` for `asset`.
+    ///
+    /// Attestors are deduplicated before evaluation.
+    /// Returns:
+    /// - `Quorum::InvalidArguments` if threshold == 0, or threshold > deduplicated_attestors.len(), or deduplicated_attestors.len() > MAX_ATTESTORS (no attestor is read)
+    /// - `Quorum::Unavailable(responding_count)` if the arguments are valid but responding_count < threshold (including zero responders)
+    /// - `Quorum::Contested(responding_count)` if responding_count >= threshold, but responding attestors differ in severity or flags
+    /// - `Quorum::Met(Safety)` if responding_count >= threshold and responding attestors agree on severity and flags
+    pub fn quorum(
+        env: Env,
+        asset: Address,
+        attestors: Vec<Address>,
+        threshold: u32,
+        max_age_secs: u64,
+    ) -> Quorum {
+        let Some((responding_count, responses)) =
+            Self::responding(&env, &asset, &attestors, threshold, max_age_secs)
+        else {
+            return Quorum::InvalidArguments;
+        };
+
         let mut max_severity = 0u32;
         let mut union_flags = 0u32;
         let mut min_severity = u32::MAX;
@@ -1066,31 +1167,26 @@ impl SafetyRegistry {
         let mut preimage_version = 0u32;
         let mut all_agree = true;
 
-        for attestor in deduped.iter() {
-            if let Some(s) = Self::get_attestation(env.clone(), attestor, asset.clone()) {
-                if max_age_secs == 0 || now.saturating_sub(s.attested_at) <= max_age_secs {
-                    if responding_count == 0 {
-                        first_flags = s.flags;
-                        evidence_hash = s.evidence_hash.clone();
-                        preimage_version = s.preimage_version;
-                    } else if s.severity != max_severity || s.flags != first_flags {
-                        all_agree = false;
-                    }
+        for (i, s) in responses.iter().enumerate() {
+            if i == 0 {
+                first_flags = s.flags;
+                evidence_hash = s.evidence_hash.clone();
+                preimage_version = s.preimage_version;
+            } else if s.severity != max_severity || s.flags != first_flags {
+                all_agree = false;
+            }
 
-                    responding_count += 1;
-                    if s.severity > max_severity {
-                        max_severity = s.severity;
-                    }
-                    if s.severity < min_severity {
-                        min_severity = s.severity;
-                    }
-                    union_flags |= s.flags;
-                    if s.attested_at > latest_timestamp {
-                        latest_timestamp = s.attested_at;
-                        evidence_hash = s.evidence_hash.clone();
-                        preimage_version = s.preimage_version;
-                    }
-                }
+            if s.severity > max_severity {
+                max_severity = s.severity;
+            }
+            if s.severity < min_severity {
+                min_severity = s.severity;
+            }
+            union_flags |= s.flags;
+            if s.attested_at > latest_timestamp {
+                latest_timestamp = s.attested_at;
+                evidence_hash = s.evidence_hash.clone();
+                preimage_version = s.preimage_version;
             }
         }
 
@@ -1123,41 +1219,20 @@ impl SafetyRegistry {
         max_severity: u32,
         max_age_secs: u64,
     ) -> bool {
-        // Deduplicate attestors
-        let mut deduped = Vec::new(&env);
-        for a in attestors.iter() {
-            let mut found = false;
-            for d in deduped.iter() {
-                if a == d {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                deduped.push_back(a);
-            }
-        }
-
-        let deduped_len = deduped.len();
-        if threshold == 0 || threshold > deduped_len || deduped_len > MAX_ATTESTORS {
+        let Some((responding_count, responses)) =
+            Self::responding(&env, &asset, &attestors, threshold, max_age_secs)
+        else {
             return false;
-        }
+        };
 
-        let now = env.ledger().timestamp();
-        let mut responding_count = 0u32;
         let mut agg_severity = 0u32;
         let mut agg_flags = 0u32;
 
-        for attestor in deduped.iter() {
-            if let Some(s) = Self::get_attestation(env.clone(), attestor, asset.clone()) {
-                if max_age_secs == 0 || now.saturating_sub(s.attested_at) <= max_age_secs {
-                    responding_count += 1;
-                    if s.severity > agg_severity {
-                        agg_severity = s.severity;
-                    }
-                    agg_flags |= s.flags;
-                }
+        for s in responses.iter() {
+            if s.severity > agg_severity {
+                agg_severity = s.severity;
             }
+            agg_flags |= s.flags;
         }
 
         if responding_count < threshold {

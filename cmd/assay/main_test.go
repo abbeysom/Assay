@@ -48,6 +48,7 @@ func deps(rep *mechanics.Report, scanErr error) (commandDeps, *bytes.Buffer, *by
 		scan: func(context.Context, mechanics.Asset) (*mechanics.Report, error) {
 			return rep, scanErr
 		},
+		scanner: newScanner,
 		serve: func(args []string, _ *slog.Logger) error {
 			*serveArgs = args
 			return nil
@@ -308,9 +309,11 @@ func TestHistoryRawWithEvidence(t *testing.T) {
 			Source:      "stellar.expert/directory",
 			URL:         "https://api.stellar.expert/explorer/directory/" + cliIssuer,
 			Claim:       `listed as "Example" (domain "example.com", tags: )`,
+			Outcome:     mechanics.EvidenceOutcomeListed,
 			RetrievedAt: mechanics.NewCanonicalTime(time.Date(2026, 9, 27, 11, 0, 0, 0, time.UTC)),
 		},
 	}
+	rep.Findings = []mechanics.Finding{{Check: "reputation", Evidence: rep.Evidence}}
 
 	d, out, _, _ := deps(rep, nil)
 	if err := runWith([]string{"history", "-raw", "USDC-" + cliIssuer}, d); err != nil {

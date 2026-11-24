@@ -2,6 +2,7 @@ package mechanics_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,14 +120,58 @@ func TestTrustlineDeauthorized(t *testing.T) {
 	}
 }
 
+// TestTrustlineMaintainLiabilities covers a trustline in the
+// authorized_to_maintain_liabilities state (CAP-0018): the holder cannot send
+// or receive but existing open offers remain active.
+func TestTrustlineMaintainLiabilities(t *testing.T) {
+	tl := &horizon.TrustlineBalance{
+		AssetCode: "TESTTKN", AssetIssuer: tlTestIssuer,
+		IsAuthorized:                      false,
+		IsAuthorizedToMaintainLiabilities: true,
+		IsClawbackEnabled:                 false,
+	}
+	f := runTL(t, tlSubject(tlTestHolder, tl, ""))
+
+	if f.Undetermined {
+		t.Fatal("maintain-liabilities trustline must not be undetermined")
+	}
+	if f.Mechanics&mechanics.MechTrustlineMaintainLiabilities == 0 {
+		t.Error("MechTrustlineMaintainLiabilities must be set for a maintain-liabilities trustline")
+	}
+	if f.Mechanics&mechanics.MechTrustlineDeauthorized != 0 {
+		t.Error("MechTrustlineDeauthorized must not be set for a maintain-liabilities trustline")
+	}
+	if f.Mechanics&mechanics.MechTrustlineClawbackEnabled != 0 {
+		t.Error("MechTrustlineClawbackEnabled must not be set when is_clawback_enabled=false")
+	}
+	if f.Severity != mechanics.Clear {
+		t.Errorf("trustline check must not set severity; got %v", f.Severity)
+	}
+	if !strings.Contains(f.Reasoning, "offers") && !strings.Contains(f.Reasoning, "liabilities") {
+		t.Errorf("maintain-liabilities reasoning must mention open offers or liabilities:\n%s", f.Reasoning)
+	}
+}
+
 // TestTrustlineHolderDoesNotHoldAsset: holder exists on the ledger but has no
 // trustline for this asset (scan.SubjectWithHolder leaves HolderTrustline nil
 // with no error when ErrNotFound is returned from the Horizon client).
 func TestTrustlineHolderDoesNotHoldAsset(t *testing.T) {
 	f := runTL(t, tlSubject(tlTestHolder, nil, ""))
 
-	if !f.Undetermined {
-		t.Fatal("absent trustline must be undetermined: the per-holder question cannot be answered")
+	if f.Undetermined {
+		t.Fatal("absent trustline must be determined: it is a ledger fact that the holder holds no asset")
+	}
+	if len(f.Evidence) != 1 {
+		t.Fatalf("absent trustline evidence entries = %d, want 1: %+v", len(f.Evidence), f.Evidence)
+	}
+	if f.Evidence[0].Claim != "no trustline for asset TESTTKN-"+tlTestIssuer {
+		t.Errorf("unexpected no-trustline evidence claim: %q", f.Evidence[0].Claim)
+	}
+	if f.Evidence[0].Attempted {
+		t.Error("no trustline is a successful ledger read, not an attempted fetch")
+	}
+	if f.Evidence[0].URL != "https://horizon.stellar.org/accounts/"+tlTestHolder {
+		t.Errorf("no-trustline evidence URL = %q", f.Evidence[0].URL)
 	}
 }
 
@@ -160,6 +205,42 @@ func TestTrustlineNoHolderSkips(t *testing.T) {
 	}
 	if f.Severity != mechanics.Clear {
 		t.Errorf("no-holder path must not set severity; got %v", f.Severity)
+	}
+}
+
+// TestTrustlineMuxedHolderSaysSoInEvidence covers issue #410: when the caller
+// supplied an M… address, the finding must name both the address asked about
+// and the base account that was actually read, so a reader cannot mistake one
+// account's trustline for another's.
+func TestTrustlineMuxedHolderSaysSoInEvidence(t *testing.T) {
+	const (
+		muxed = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAABUTGI4"
+		base  = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ"
+	)
+	tl := &horizon.TrustlineBalance{
+		AssetCode: "TESTTKN", AssetIssuer: tlTestIssuer,
+		IsAuthorized: true, IsClawbackEnabled: true,
+	}
+	s := tlSubject(base, tl, "")
+	s.HolderMuxed = muxed
+	s.HolderMuxedID = 420
+
+	f := runTL(t, s)
+	if len(f.Evidence) == 0 {
+		t.Fatal("no evidence recorded for a muxed holder")
+	}
+	claim := f.Evidence[0].Claim
+	if !strings.Contains(claim, muxed) {
+		t.Errorf("evidence claim does not name the muxed address asked about: %q", claim)
+	}
+	if !strings.Contains(claim, base) {
+		t.Errorf("evidence claim does not name the base account actually read: %q", claim)
+	}
+	if !strings.Contains(claim, "420") {
+		t.Errorf("evidence claim does not name the multiplexing id: %q", claim)
+	}
+	if !strings.Contains(claim, "trustline TESTTKN-"+tlTestIssuer) {
+		t.Errorf("evidence claim lost the trustline it describes: %q", claim)
 	}
 }
 

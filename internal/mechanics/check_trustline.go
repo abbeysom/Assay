@@ -3,9 +3,6 @@ package mechanics
 import (
 	"context"
 	"fmt"
-	"net/url"
-
-	"github.com/use-assay/assay/internal/horizon"
 )
 
 // TrustlineCheck reports the actual flags on a specific holder's trustline.
@@ -38,6 +35,28 @@ func (TrustlineCheck) Describe() string {
 		"auth_clawback_enabled flag. Does not affect severity."
 }
 
+// Inputs implements Check.
+//
+// The holder fields are the whole subject of this check; it reads no reputational
+// or capability source. HolderMuxed/HolderMuxedID are read only to state that a
+// muxed address was resolved to Holder, and Asset names the trustline it
+// describes.
+func (TrustlineCheck) Inputs() []string {
+	return []string{
+		"Asset",
+		"Holder",
+		"HolderAttemptedAt",
+		"HolderFetchedAt",
+		"HolderLedger",
+		"HolderMuxed",
+		"HolderMuxedID",
+		"HolderTrustline",
+		"HolderTrustlineErr",
+		"HorizonURL",
+		"Network",
+	}
+}
+
 // Run implements Check.
 func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 	f := Finding{
@@ -51,11 +70,23 @@ func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 		return f, nil
 	}
 
-	holderURL := horizon.DefaultURL + "/accounts/" + url.PathEscape(s.Holder)
+	holderURL := s.horizonAccountURL(s.Holder)
+
+	// A muxed (M…) holder has no ledger entry of its own: the lookup is made
+	// against the base G… account it resolves to. Saying so in the evidence —
+	// rather than quietly reporting the base account's trustline — is what keeps
+	// the report honest about which account was actually read (issue #410).
+	holderNote := ""
+	if s.HolderMuxed != "" {
+		holderNote = fmt.Sprintf(
+			"holder address %s is muxed (multiplexing id %d); resolved to its base account %s. ",
+			s.HolderMuxed, s.HolderMuxedID, s.Holder)
+	}
 
 	if s.HolderTrustlineErr != "" {
 		f.Undetermined = true
-		f.Reasoning = fmt.Sprintf(
+		f.UndeterminedSource = "horizon"
+		f.Reasoning = holderNote + fmt.Sprintf(
 			"Could not fetch trustline flags for holder %s: %s. "+
 				"This does not mean the holder is safe — it means the "+
 				"holder-specific answer is unknown.",
@@ -65,7 +96,7 @@ func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 		f.Evidence = append(f.Evidence, Evidence{
 			Source: "horizon",
 			URL:    holderURL,
-			Claim:  "not retrievable: " + s.HolderTrustlineErr,
+			Claim:  holderNote + "not retrievable: " + s.HolderTrustlineErr,
 			// Fetch failed: attempt time, marked as an attempt.
 			RetrievedAt:    NewCanonicalTime(s.HolderAttemptedAt),
 			Attempted:      true,
@@ -76,11 +107,19 @@ func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 	}
 
 	if s.HolderTrustline == nil {
-		f.Undetermined = true
-		f.Reasoning = fmt.Sprintf(
-			"Holder %s does not hold this asset: no trustline exists to inspect.",
-			s.Holder,
+		f.Reasoning = holderNote + fmt.Sprintf(
+			"Holder %s does not hold this asset: no trustline exists for %s-%s.",
+			s.Holder, s.Asset.Code, s.Asset.Issuer,
 		)
+		hLedger := s.holderLedger()
+		f.Evidence = append(f.Evidence, Evidence{
+			Source:         "horizon",
+			URL:            holderURL,
+			Claim:          holderNote + fmt.Sprintf("no trustline for asset %s-%s", s.Asset.Code, s.Asset.Issuer),
+			RetrievedAt:    NewCanonicalTime(s.HolderFetchedAt),
+			LatestLedger:   hLedger,
+			LedgerSequence: hLedger,
+		})
 		return f, nil
 	}
 
@@ -89,7 +128,9 @@ func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 	if tl.IsClawbackEnabled {
 		mech |= MechTrustlineClawbackEnabled
 	}
-	if !tl.IsAuthorized {
+	if !tl.IsAuthorized && tl.IsAuthorizedToMaintainLiabilities {
+		mech |= MechTrustlineMaintainLiabilities
+	} else if !tl.IsAuthorized {
 		mech |= MechTrustlineDeauthorized
 	}
 	f.Mechanics = mech
@@ -98,9 +139,9 @@ func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 	f.Evidence = append(f.Evidence, Evidence{
 		Source: "horizon",
 		URL:    holderURL,
-		Claim: fmt.Sprintf(
-			"trustline %s-%s: is_clawback_enabled=%t is_authorized=%t",
-			tl.AssetCode, tl.AssetIssuer, tl.IsClawbackEnabled, tl.IsAuthorized,
+		Claim: holderNote + fmt.Sprintf(
+			"trustline %s-%s: is_clawback_enabled=%t is_authorized=%t is_authorized_to_maintain_liabilities=%t",
+			tl.AssetCode, tl.AssetIssuer, tl.IsClawbackEnabled, tl.IsAuthorized, tl.IsAuthorizedToMaintainLiabilities,
 		),
 		RetrievedAt:    NewCanonicalTime(s.HolderFetchedAt),
 		LatestLedger:   hLedger,
@@ -108,7 +149,7 @@ func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 	})
 
 	switch {
-	case tl.IsClawbackEnabled && !tl.IsAuthorized:
+	case tl.IsClawbackEnabled && !tl.IsAuthorized && !tl.IsAuthorizedToMaintainLiabilities:
 		f.Reasoning = fmt.Sprintf(
 			"Holder %s opened this trustline while auth_clawback_enabled was active on "+
 				"the issuer. Under CAP-0035, is_clawback_enabled was set on the trustline "+
@@ -116,6 +157,18 @@ func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 				"confiscate this holder's balance. The trustline is also deauthorized: the "+
 				"holder cannot currently transact. Severity is not affected by this finding "+
 				"because severity is issuer-level, not holder-specific.",
+			s.Holder,
+		)
+	case tl.IsClawbackEnabled && !tl.IsAuthorized && tl.IsAuthorizedToMaintainLiabilities:
+		f.Reasoning = fmt.Sprintf(
+			"Holder %s opened this trustline while auth_clawback_enabled was active on "+
+				"the issuer. Under CAP-0035, is_clawback_enabled was set on the trustline "+
+				"at creation time and cannot be cleared retroactively. The issuer can "+
+				"confiscate this holder's balance. The trustline is in the "+
+				"authorized_to_maintain_liabilities state (CAP-0018): the holder cannot "+
+				"send or receive this asset but existing open offers remain active. "+
+				"Severity is not affected by this finding because severity is "+
+				"issuer-level, not holder-specific.",
 			s.Holder,
 		)
 	case tl.IsClawbackEnabled:
@@ -127,7 +180,18 @@ func (c TrustlineCheck) Run(_ context.Context, s *Subject) (Finding, error) {
 				"because severity is issuer-level, not holder-specific.",
 			s.Holder,
 		)
-	case !tl.IsAuthorized:
+	case !tl.IsAuthorized && tl.IsAuthorizedToMaintainLiabilities:
+		f.Reasoning = fmt.Sprintf(
+			"Holder %s has a trustline in the authorized_to_maintain_liabilities state "+
+				"(CAP-0018): a SetTrustLineFlagsOp issued by the issuer has partially frozen "+
+				"this trustline. The holder cannot currently send or receive this asset, but "+
+				"existing open offers remain active and are not automatically cancelled. "+
+				"This is distinct from a full deauthorization: the issuer has applied a "+
+				"partial freeze rather than a complete revocation. The trustline does not "+
+				"have is_clawback_enabled set. Severity is not affected by this finding.",
+			s.Holder,
+		)
+	case !tl.IsAuthorized && !tl.IsAuthorizedToMaintainLiabilities:
 		f.Reasoning = fmt.Sprintf(
 			"Holder %s has a deauthorized trustline: they cannot currently send or receive "+
 				"this asset. The trustline does not have is_clawback_enabled set, so even if "+
